@@ -1,0 +1,228 @@
+name: Build OpenWrt HC5861B
+
+on:
+  workflow_dispatch:
+    inputs:
+      PROXY_CORE:
+        description: '代理核心 (128MB RAM 建议 xray 或 lightweight)'
+        required: true
+        default: 'xray'
+        type: choice
+        options:
+          - xray
+          - sing-box
+          - lightweight
+          - all
+      RELEASE:
+        description: '发布到 Release'
+        type: boolean
+        default: true
+
+env:
+  REPO_URL: https://github.com/openwrt/openwrt.git
+  REPO_BRANCH: v23.05.5
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+
+    - name: Install dependencies
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install -y \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+          build-essential bzip2 ccache clang cmake cpio curl \
+          device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+          g++-multilib git gnutls-dev gperf haveged help2man intltool jq \
+          lib32gcc-s1 libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+          libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev \
+          libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool \
+          libz-dev lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full \
+          patch pkgconf python3 python3-pyelftools python3-setuptools \
+          qemu-utils rsync scons squashfs-tools subversion swig texinfo \
+          uglifyjs unzip upx-ucl vim wget xmlto xxd zlib1g-dev zstd
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone OpenWrt ${{ env.REPO_BRANCH }}
+      working-directory: /workdir
+      run: |
+        git clone --depth 1 --branch $REPO_BRANCH $REPO_URL openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        cd openwrt
+        echo "✅ OpenWrt $(cat version) @ $(git log --oneline -1)"
+
+    - name: Add Passwall2 feeds
+      run: |
+        chmod +x scripts/feeds.sh
+        cd openwrt
+        $GITHUB_WORKSPACE/scripts/feeds.sh
+
+    - name: Update and install feeds
+      run: |
+        cd openwrt
+
+        for i in 1 2 3; do
+          ./scripts/feeds update -a && break
+          echo "⚠️  Retry $i/3..."
+          sleep 15
+        done
+
+        ./scripts/feeds install -a
+
+        echo "--- Verify feeds ---"
+        test -d feeds/passwall_packages && echo "✅ passwall_packages" || { echo "❌ passwall_packages MISSING"; exit 1; }
+        test -d feeds/passwall2          && echo "✅ passwall2"          || { echo "❌ passwall2 MISSING"; exit 1; }
+
+        echo "--- Verify packages ---"
+        ./scripts/feeds list | grep -c passwall
+        ./scripts/feeds list | grep -q "luci-app-passwall2" && echo "✅ luci-app-passwall2" || { echo "❌ NOT FOUND"; exit 1; }
+
+    - name: Generate configuration
+      env:
+        PROXY_CORE: ${{ github.event.inputs.PROXY_CORE || 'xray' }}
+      run: |
+        chmod +x scripts/customize.sh
+        cd openwrt
+        cp $GITHUB_WORKSPACE/configs/hc5861b.config .config
+
+        $GITHUB_WORKSPACE/scripts/customize.sh "$PROXY_CORE"
+
+        make defconfig
+
+        echo "========== diffconfig =========="
+        ./scripts/diffconfig.sh
+        echo "================================"
+
+    - name: Download packages
+      run: |
+        cd openwrt
+        make download -j16
+        find dl -size -1024c -exec rm -f {} \;
+        echo "✅ $(ls dl/ | wc -l) source archives downloaded"
+
+    - name: Compile
+      id: compile
+      run: |
+        cd openwrt
+        echo "Started: $(date)"
+        echo "Threads: $(nproc)"
+
+        make -j$(nproc) 2>&1 | tee /tmp/build.log | grep -E "^\[|error|warning" | tail -50
+        BUILD_EXIT=${PIPESTATUS[0]}
+
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo ""
+          echo "⚠️  Parallel build failed, retrying single-thread..."
+          echo ""
+          make -j1 V=s 2>&1 | tail -200
+          BUILD_EXIT=$?
+        fi
+
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "❌ Build FAILED"
+          exit 1
+        fi
+
+        echo "Finished: $(date)"
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Verify firmware
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        # ★ 关键：MT7620 的输出目录
+        OUTPUT="openwrt/bin/targets/ramips/mt7620"
+
+        echo "========== Output files =========="
+        ls -lhS "$OUTPUT"/ 2>/dev/null || { echo "❌ Output directory not found!"; exit 1; }
+        echo "=================================="
+
+        # 查找 sysupgrade 固件
+        SYSUPGRADE=$(find "$OUTPUT" -name "*hc5861b*sysupgrade*" -type f | head -1)
+        if [ -n "$SYSUPGRADE" ]; then
+          SIZE=$(ls -lh "$SYSUPGRADE" | awk '{print $5}')
+          echo "✅ Sysupgrade: $(basename $SYSUPGRADE) ($SIZE)"
+        else
+          echo "❌ Sysupgrade firmware NOT FOUND"
+          echo "All files in output:"
+          find "$OUTPUT" -type f -name "*.bin" -o -name "*.img" | sort
+          exit 1
+        fi
+
+        # 查找 factory 固件
+        FACTORY=$(find "$OUTPUT" -name "*hc5861b*factory*" -type f | head -1)
+        if [ -n "$FACTORY" ]; then
+          SIZE=$(ls -lh "$FACTORY" | awk '{print $5}')
+          echo "✅ Factory: $(basename $FACTORY) ($SIZE)"
+        else
+          echo "⚠️  Factory firmware not found (may not be needed)"
+        fi
+
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        cd openwrt/bin/targets/ramips/mt7620
+        rm -rf packages/
+        rm -f *.buildinfo *.manifest sha256sums
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success'
+      with:
+        name: OpenWrt-HC5861B-${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}/*
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      if: steps.compile.outputs.status == 'success' && github.event.inputs.RELEASE == 'true'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v23.05.5-${{ env.FILE_DATE }}
+        body: |
+          ## OpenWrt 23.05.5 — 极路由3 Pro (HC5861B)
+
+          | 项目 | 值 |
+          |---|---|
+          | 设备 | HiWiFi R33 (HC5861B) 极路由3 Pro |
+          | CPU | MT7620A 单核 580MHz |
+          | 内存 | 128MB DDR2 RAM / 128MB NAND |
+          | 代理核心 | ${{ github.event.inputs.PROXY_CORE }} |
+          | 默认 IP | **192.168.10.1** |
+          | 默认密码 | 无 (首次登录设置) |
+
+          ### 包含组件
+          - ✅ Passwall2 代理 (中文)
+          - ✅ ChinaDNS-NG DNS 分流
+          - ✅ IPv6 支持
+          - ✅ 双频 WiFi (2.4G + 5G)
+          - ✅ 千兆网口 (RTL8367RB)
+
+          ### 刷机
+          - Breed → `factory.bin`
+          - OpenWrt → `sysupgrade.bin`
+        files: ${{ env.FIRMWARE }}/*
